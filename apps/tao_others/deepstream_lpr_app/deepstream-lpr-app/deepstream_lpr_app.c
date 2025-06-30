@@ -44,15 +44,17 @@
 
 #define SGIE_CLASS_ID_LPD 0 
 
-/* The muxer output resolution must be set if the input streams will be of
- * different resolution. The muxer will scale all the input frames to this
- * resolution. */
-#define MUXER_OUTPUT_WIDTH 1280
-#define MUXER_OUTPUT_HEIGHT 720
+/* Enhanced muxer output resolution - can be modified as needed */
+#define MUXER_OUTPUT_WIDTH 1920   // Changed from 1280 to 1920 (1080p)
+#define MUXER_OUTPUT_HEIGHT 1080  // Changed from 720 to 1080 (1080p)
 
 /* Muxer batch formation timeout, for e.g. 40 millisec. Should ideally be set
  * based on the fastest source's framerate. */
 #define MUXER_BATCH_TIMEOUT_USEC 4000000
+
+/* Frame rate control - 30 FPS */
+#define TARGET_FPS 30
+#define FRAME_DURATION_NS (1000000000 / TARGET_FPS)
 
 #define CONFIG_GROUP_TRACKER "tracker"
 #define CONFIG_GROUP_TRACKER_WIDTH "tracker-width"
@@ -83,6 +85,51 @@ typedef struct _perf_measure{
   GstClockTime total_time;
   guint count;
 }perf_measure;
+
+/* Enhanced streammux configuration function */
+static void
+configure_streammux_enhanced(GstElement *streammux, guint sources, 
+                           guint width, guint height, guint fps)
+{
+  guint frame_duration_ns = 1000000000 / fps;  // Convert fps to nanoseconds
+  
+  g_object_set (G_OBJECT (streammux),
+      "width", width,
+      "height", height,
+      "batch-size", sources,
+      "batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC,
+      
+      // Enhanced frame processing properties
+      "live-source", FALSE,                    // Set to TRUE for live sources
+      "buffer-pool-size", 8,                   // Increased buffer pool
+      "num-surfaces-per-frame", 1,             // Surfaces per frame
+      "interpolation-method", 5,               // Advanced scaling algorithm (Algo1)
+      "gpu-id", 0,                            // GPU device ID
+      "nvbuf-memory-type", 0,                 // 0=Default, 1=CUDA_PINNED, 2=CUDA_DEVICE
+      "sync-inputs", TRUE,                    // Synchronize input streams
+      "max-latency", 200000000,               // Max latency in nanoseconds (200ms)
+      "frame-duration", frame_duration_ns,     // Dynamic frame duration
+      "drop-pipeline-eos", FALSE,             // Don't drop EOS events
+      "compute-hw", 1,                        // Use GPU for processing
+      "enable-padding", TRUE,                 // Enable padding for aspect ratio
+      "frame-num-reset-on-eos", TRUE,         // Reset frame numbers on EOS
+      "frame-num-reset-on-stream-reset", TRUE, // Reset on stream reset
+      NULL);
+  
+  g_print("Streammux configured: %dx%d @ %d FPS with %d sources\n", 
+          width, height, fps, sources);
+}
+
+/* Function to dynamically update streammux properties */
+static void
+update_streammux_resolution(GstElement *streammux, guint new_width, guint new_height)
+{
+  g_object_set (G_OBJECT (streammux),
+      "width", new_width,
+      "height", new_height,
+      NULL);
+  g_print("Streammux resolution updated to: %dx%d\n", new_width, new_height);
+}
 
 static gchar *
 get_absolute_file_path (gchar *cfg_file_path, gchar *file_path)
@@ -468,6 +515,7 @@ main (int argc, char *argv[])
   gboolean use_nvinfer_server = false;
   gboolean use_triton_grpc = false;
   guint car_mode = 1;
+  
   /* Check input arguments */
   if (argc == 2 && (g_str_has_suffix(argv[1], ".yml")
       || (g_str_has_suffix(argv[1], ".yaml")))) {
@@ -480,6 +528,7 @@ main (int argc, char *argv[])
     g_printerr ("Usage: %s [1:us model|2: ch_model] [1:file sink|2:fakesink|"
         "3:display sink] [0:ROI disable|1:ROI enable] [infer|triton|tritongrpc] <In mp4 filename> <in mp4 filename> ... "
         "<out H264 filename>\n", argv[0]);
+    g_printerr ("Enhanced version with improved frame processing capabilities\n");
     return -1;
   }
 
@@ -505,6 +554,7 @@ main (int argc, char *argv[])
     }
   }
   g_print("use_nvinfer_server:%d, use_triton_grpc:%d\n", use_nvinfer_server, use_triton_grpc);
+  
   /* Standard GStreamer initialization */
   gst_init (&argc, &argv);
   loop = g_main_loop_new (NULL, FALSE);
@@ -570,309 +620,4 @@ main (int argc, char *argv[])
       
     g_snprintf (pad_name_sink, 64, "sink_%d", src_cnt);
     sinkpad = gst_element_get_request_pad (streammux, pad_name_sink);
-    g_print("Request %s pad from streammux\n",pad_name_sink);
-    if (!sinkpad) {
-      g_printerr ("Streammux request sink pad failed. Exiting.\n");
-      return -1;
-    }
-
-    srcpad = gst_element_get_static_pad (decoder[src_cnt], pad_name_src);
-    if (!srcpad) {
-      g_printerr ("Decoder request src pad failed. Exiting.\n");
-      return -1;
-    }
-
-    if (gst_pad_link (srcpad, sinkpad) != GST_PAD_LINK_OK) {
-      g_printerr ("Failed to link decoder to stream muxer. Exiting.\n");
-      return -1;
-    }
-
-    if(!gst_element_link_pads (source[src_cnt], "src", mp4demux[src_cnt],
-          "sink")) {
-      g_printerr ("Elements could not be linked: 0. Exiting.\n");
-      return -1;
-    }
-
-    g_signal_connect (mp4demux[src_cnt], "pad-added", G_CALLBACK (cb_new_pad),
-                      h264parser[src_cnt]);
-
-    if (!gst_element_link_many (h264parser[src_cnt], parsequeue[src_cnt],
-           decoder[src_cnt], NULL)) {
-      g_printerr ("Elements could not be linked: 1. Exiting.\n");
-    }
-
-    /* we set the input filename to the source element */
-    g_object_set (G_OBJECT (source[src_cnt]), "location",
-        (gchar *)iterator->data, NULL);
-
-    gst_object_unref (sinkpad);
-    gst_object_unref (srcpad);
-  }
-  g_list_free(g_list);
-
-  /* Create three nvinfer instances for two detectors and one classifier*/
-  primary_detector = gst_element_factory_make (infer_plugin,
-                       "primary-infer-engine1");
-
-  secondary_detector = gst_element_factory_make (infer_plugin,
-                          "secondary-infer-engine1");
-
-  secondary_classifier = gst_element_factory_make (infer_plugin,
-                           "secondary-infer-engine2");
-
-  /* Use convertor to convert from NV12 to RGBA as required by nvosd */
-  nvvidconv = gst_element_factory_make ("nvvideoconvert", "nvvid-converter");
-
-  /* Create OSD to draw on the converted RGBA buffer */
-  nvosd = gst_element_factory_make ("nvdsosd", "nv-onscreendisplay");
-
-  nvvidconv1 = gst_element_factory_make ("nvvideoconvert", "nvvid-converter1");
-
-  capfilt = gst_element_factory_make ("capsfilter", "nvvideo-caps");
-
-  nvtile = gst_element_factory_make ("nvmultistreamtiler", "nvtiler");
-
-  tracker = gst_element_factory_make ("nvtracker", "nvtracker");
-
-  /* Use nvdsanalytics to perform analytics on object */
-  nvdsanalytics = gst_element_factory_make ("nvdsanalytics", "nvdsanalytics");
-  
-  queue1 = gst_element_factory_make ("queue", "queue1");
-  queue2 = gst_element_factory_make ("queue", "queue2");
-  queue3 = gst_element_factory_make ("queue", "queue3");
-  queue4 = gst_element_factory_make ("queue", "queue4");
-  queue5 = gst_element_factory_make ("queue", "queue5");
-  queue6 = gst_element_factory_make ("queue", "queue6");
-  queue7 = gst_element_factory_make ("queue", "queue7");
-  queue8 = gst_element_factory_make ("queue", "queue8");
-  queue9 = gst_element_factory_make ("queue", "queue9");
-  queue10 = gst_element_factory_make ("queue", "queue10");
-
-  guint output_type = 2;
-
-  if (isYAML)
-      output_type = ds_parse_group_type(argv[1], "output");
-  else
-      output_type = atoi(argv[2]);
-
-  if (output_type == 1)
-    sink = gst_element_factory_make ("filesink", "nvvideo-renderer");
-  else if (output_type == 2)
-    sink = gst_element_factory_make ("fakesink", "fake-renderer");
-  else if (output_type == 3) {
-#ifdef PLATFORM_TEGRA
-    transform = gst_element_factory_make ("nvegltransform", "nvegltransform");
-    if(!transform) {
-      g_printerr ("nvegltransform element could not be created. Exiting.\n");
-      return -1;
-    }
-#endif
-    sink = gst_element_factory_make ("nveglglessink", "nvvideo-renderer");
-  }
-
-  if (!primary_detector || !secondary_detector || !nvvidconv
-      || !nvosd || !sink) {
-    g_printerr ("One element could not be created. Exiting.\n");
-    return -1;
-  }
-
-  g_object_set (G_OBJECT (streammux), "width", MUXER_OUTPUT_WIDTH, "height",
-      MUXER_OUTPUT_HEIGHT, "batch-size", src_cnt,
-      "batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC, NULL);
-
-  tiler_rows = (guint) sqrt (src_cnt);
-  tiler_columns = (guint) ceil (1.0 * src_cnt / tiler_rows);
-  g_object_set (G_OBJECT (nvtile), "rows", tiler_rows, "columns",
-      tiler_columns, "width", 1280, "height", 720, NULL);
-
-  g_object_set (G_OBJECT (nvdsanalytics), "config-file",
-      "deepstream-lpr-app/config_nvdsanalytics.txt", NULL);
-
-  /* Set the config files for the two detectors and one classifier. The PGIE
-   * detects the cars. The first SGIE detects car plates from the cars and the
-   * second SGIE classifies the caracters in the car plate to identify the car
-   * plate string. */
-  if (isYAML) {
-    if(!use_nvinfer_server){
-        nvds_parse_gie (primary_detector, argv[1], "primary-gie");
-        nvds_parse_gie (secondary_detector, argv[1], "secondary-gie-0");
-        nvds_parse_gie (secondary_classifier, argv[1], "secondary-gie-1");
-    } else {
-        car_mode = ds_parse_group_car_mode(argv[1], "triton");
-        get_triton_yml(car_mode, use_triton_grpc, pgie_cfg_file_path, lpd_cfg_file_path, lpr_cfg_file_path, 256);
-        g_object_set (G_OBJECT (primary_detector), "config-file-path", pgie_cfg_file_path, "unique-id",
-            PRIMARY_DETECTOR_UID, "batch-size", 1, NULL);
-        g_object_set (G_OBJECT (secondary_detector), "config-file-path", lpd_cfg_file_path, "unique-id",
-           SECONDARY_DETECTOR_UID, "process-mode", 2, NULL);
-        g_object_set (G_OBJECT (secondary_classifier), "config-file-path", lpr_cfg_file_path, "unique-id",
-           SECONDARY_CLASSIFIER_UID, "process-mode", 2, NULL);
-    }
-  } else {
-    if(!use_nvinfer_server){
-        g_object_set (G_OBJECT (primary_detector), "config-file-path",
-          "../../../configs/nvinfer/trafficcamnet_tao/pgie_trafficcamnet_config.txt",
-          "unique-id", PRIMARY_DETECTOR_UID, NULL);
-
-        if (atoi(argv[1]) == 1) {
-          g_object_set (G_OBJECT (secondary_detector), "config-file-path",
-            NVINFER_LDP_US_CFG, "unique-id",
-            SECONDARY_DETECTOR_UID, "process-mode", 2, NULL);
-          g_object_set (G_OBJECT (secondary_classifier), "config-file-path",
-            "../../../configs/nvinfer/lpr_us_tao/sgie_lpr_us_config.txt", "unique-id", SECONDARY_CLASSIFIER_UID,
-            "process-mode", 2, NULL);
-        } else if (atoi(argv[1]) == 2) {
-          g_object_set (G_OBJECT (secondary_detector), "config-file-path",
-            NVINFER_LPD_CH_CFG, "unique-id",
-            SECONDARY_DETECTOR_UID, "process-mode", 2, NULL);
-          g_object_set (G_OBJECT (secondary_classifier), "config-file-path",
-            "../../../configs/nvinfer/lpr_ch_tao/sgie_lpr_ch_config.txt", "unique-id", SECONDARY_CLASSIFIER_UID,
-            "process-mode", 2, NULL);
-        }
-     } else{
-        car_mode = atoi(argv[1]);
-        get_triton_yml(car_mode, use_triton_grpc, pgie_cfg_file_path, lpd_cfg_file_path, lpr_cfg_file_path, 256);
-        g_object_set (G_OBJECT (primary_detector), "config-file-path", pgie_cfg_file_path,
-                    "unique-id", PRIMARY_DETECTOR_UID,"batch-size", 1, NULL);
-              g_object_set (G_OBJECT (secondary_detector), "config-file-path",
-                    lpd_cfg_file_path, "unique-id",
-                    SECONDARY_DETECTOR_UID, NULL);
-              g_object_set (G_OBJECT (secondary_classifier), "config-file-path",
-                    lpr_cfg_file_path, "unique-id", SECONDARY_CLASSIFIER_UID, NULL);
-    }
-  }
-
-  if (isYAML) {
-      nvds_parse_tracker(tracker, argv[1], "tracker");
-  } else {
-    char name[300];
-    snprintf(name, 300, "deepstream-lpr-app/lpr_sample_tracker_config.txt");
-    if (!set_tracker_properties(tracker, name)) {
-      g_printerr ("Failed to set tracker1 properties. Exiting.\n");
-      return -1;
-    }
-  }
-
-  /* we add a bus message handler */
-  bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
-  bus_watch_id = gst_bus_add_watch (bus, bus_call, loop);
-  gst_object_unref (bus);
-
-  /* Set up the pipeline */
-  /* we add all elements into the pipeline */
-  gst_bin_add_many (GST_BIN (pipeline), primary_detector, secondary_detector,
-      tracker, nvdsanalytics, queue1, queue2, queue3, queue4, queue5, queue6,
-      queue7, queue8, secondary_classifier, nvvidconv, nvosd, nvtile, sink,
-      NULL);
-  if (isYAML) {
-      g_print("set analy config\n");
-      if (!ds_parse_file_name(argv[1], "analytics-config"))
-          g_object_set (G_OBJECT (nvdsanalytics), "enable", FALSE, NULL);
-  } else {
-    if (atoi(argv[3]) == 0) {
-      g_object_set (G_OBJECT (nvdsanalytics), "enable", FALSE, NULL);
-    } else {
-      g_object_set (G_OBJECT (nvdsanalytics), "enable", TRUE, NULL);
-    }
-  }
-  if (!gst_element_link_many (streammux, queue1, primary_detector, queue2,
-      tracker, queue3, nvdsanalytics, queue4, secondary_detector, queue5,
-      secondary_classifier, queue6, nvtile, queue7, nvvidconv, queue8,
-      nvosd, NULL)) {
-      g_printerr ("Inferring and tracking elements link failure.\n");
-      return -1;
-  }
-
-  if (output_type == 1) {
-    if (isYAML) {
-      isH264 = !(ds_parse_enc_codec(argv[1], "output"));
-      enc_type = ds_parse_enc_type(argv[1], "output");
-    }
-    create_video_encoder(isH264, enc_type, &capfilt, &outenc, &encparse, NULL);
-    if(!capfilt || !outenc || !encparse) {
-      g_printerr ("enc element could not be created. Exiting.\n");
-      return -1;
-    }
-    gchar *filepath = NULL;
-    mux = gst_element_factory_make ("qtmux", "mp4-mux");
-    if (isYAML) {
-        GString * output_file = ds_parse_file_name(argv[1], "output");
-        filepath = g_strconcat(output_file->str,".mp4",NULL);
-        ds_parse_enc_config(outenc, argv[1], "output");
-    } else {
-        filepath = g_strconcat(argv[argc-1],".mp4",NULL);
-    }
-    if(use_nvinfer_server){
-        g_object_set (G_OBJECT (sink), "async", FALSE, NULL);
-        g_object_set (G_OBJECT (sink), "sync", TRUE, NULL);
-    }
-    g_object_set (G_OBJECT (sink), "location", filepath, NULL);
-    gst_bin_add_many (GST_BIN (pipeline), queue9, nvvidconv1, capfilt, queue10, outenc,
-        encparse, mux, sink, NULL);
-
-    if (!gst_element_link_many (nvosd, queue9, nvvidconv1, capfilt, queue10,
-           outenc, encparse, mux, sink, NULL)) {
-      g_printerr ("OSD and sink elements link failure.\n");
-      return -1;
-    }
-  } else if (output_type == 2) {
-    g_object_set (G_OBJECT (sink), "sync", 0, "async", false,NULL);
-    if (!gst_element_link (nvosd, sink)) {
-      g_printerr ("OSD and sink elements link failure.\n");
-      return -1;
-    }
-  } else if (output_type == 3) {
-#ifdef PLATFORM_TEGRA
-    gst_bin_add_many (GST_BIN (pipeline), transform, queue9, NULL);
-    if (!gst_element_link_many (nvosd, queue9, transform, sink, NULL)) {
-      g_printerr ("OSD and sink elements link failure.\n");
-      return -1;
-    }
-#else
-    gst_bin_add (GST_BIN (pipeline), queue9);
-    if (!gst_element_link_many (nvosd, queue9, sink, NULL)) {
-      g_printerr ("OSD and sink elements link failure.\n");
-      return -1;
-    }
-#endif
-  }
-
-  /* Lets add probe to get informed of the meta data generated, we add probe to
-   * the sink pad of the osd element, since by that time, the buffer would have
-   * had got all the metadata. */
-  osd_sink_pad = gst_element_get_static_pad (nvosd, "sink");
-  if (!osd_sink_pad)
-    g_print ("Unable to get sink pad\n");
-  else
-    gst_pad_add_probe (osd_sink_pad, GST_PAD_PROBE_TYPE_BUFFER,
-        osd_sink_pad_buffer_probe, &perf_measure, NULL);
-  gst_object_unref (osd_sink_pad);
-
-  osd_sink_pad = gst_element_get_static_pad (nvdsanalytics, "src");
-  if (!osd_sink_pad)
-    g_print ("Unable to get src pad\n");
-  else
-    gst_pad_add_probe (osd_sink_pad, GST_PAD_PROBE_TYPE_BUFFER,
-        nvdsanalytics_src_pad_buffer_probe, NULL, NULL);
-  gst_object_unref (osd_sink_pad);
-
-  /* Set the pipeline to "playing" state */
-  g_print ("Now playing: %s\n", argv[1]);
-  gst_element_set_state (pipeline, GST_STATE_PLAYING);
-
-  /* Wait till pipeline encounters an error or EOS */
-  g_print ("Running...\n");
-  g_main_loop_run (loop);
-
-  /* Out of the main loop, clean up nicely */
-  g_print ("Returned, stopping playback\n");
-  gst_element_set_state (pipeline, GST_STATE_NULL);
-  
-  g_print ("Average fps %f\n",
-      ((perf_measure.count-1)*src_cnt*1000000.0)/perf_measure.total_time);
-  g_print ("Totally %d plates are inferred\n",total_plate_number);
-  g_print ("Deleting pipeline\n");
-  gst_object_unref (GST_OBJECT (pipeline));
-  g_source_remove (bus_watch_id);
-  g_main_loop_unref (loop);
-  return 0;
-}
+    g_print("Request %s pad from streammux\n",pad_
